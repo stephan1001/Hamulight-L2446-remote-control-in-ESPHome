@@ -1,0 +1,303 @@
+esphome:
+  name: terrassenbeleuchtung
+  friendly_name: Terrassenbeleuchtung
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          char buf[8];
+          snprintf(buf, sizeof(buf), "%06X", (unsigned int) (id(remote_id) & 0xFFFFFF));
+          id(remote_id_text).publish_state(std::string(buf));
+          id(learn_status).publish_state("bereit");
+
+esp32:
+  board: esp32dev
+
+logger:
+
+api:
+  encryption:
+    key: !secret terrassenbeleuchtung__api_encryption_key
+ota:
+  - platform: esphome
+    encryption:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO23
+  miso_pin: GPIO19
+
+cc1101:
+  cs_pin: GPIO5
+  frequency: 433.96MHz
+  modulation_type: 2-FSK
+  filter_bandwidth: 200kHz
+
+# ---------------------------------------------------------------------------
+# Gespeicherte Werte
+# ---------------------------------------------------------------------------
+globals:
+  # Die 24-Bit-Kennung der Fernbedienung (Bits 1-24 jedes Frames).
+  # Standardwert = Fernbedienung des Entwicklers, per Button "Fernbedienung anlernen" ersetzbar.
+  - id: remote_id
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0xB1A8BA'
+  # Hilfsvariablen fuer den Anlernmodus (nicht gespeichert)
+  - id: learn_mode
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: learn_cand
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: learn_cnt
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+# ---------------------------------------------------------------------------
+# Senden
+# ---------------------------------------------------------------------------
+remote_transmitter:
+  pin: GPIO26             # GDO0
+  carrier_duty_percent: 100%
+  eot_level: false
+  non_blocking: true
+  on_transmit:
+    then:
+      - cc1101.set_idle:
+      - remote_transmitter.digital_write: false
+      - cc1101.begin_tx:
+  on_complete:
+    then:
+      - cc1101.set_idle:
+      - remote_transmitter.digital_write: true
+      - cc1101.begin_rx:
+
+# ---------------------------------------------------------------------------
+# Empfangen
+# ---------------------------------------------------------------------------
+remote_receiver:
+  pin: GPIO27                # GDO2
+  filter: 100us
+  idle: 5ms                  # trennt die Frames (Sync-Pause ca. 12,9 ms)
+  buffer_size: 10kb
+  on_raw:
+    then:
+      - lambda: |-
+          auto rev8 = [](uint8_t v) {
+            uint8_t r = 0;
+            for (int i = 0; i < 8; i++) r = (r << 1) | ((v >> i) & 1);
+            return r;
+          };
+
+          // 1) Genau 48 Bit aus der Aufnahme dekodieren (Toleranz +-250 us)
+          uint64_t frame = 0;
+          int n = 0;
+          for (size_t i = 0; i + 1 < x.size() && n < 48; i += 2) {
+            int32_t high = x[i];
+            int32_t low = x[i + 1];
+            if (abs(high - 1250) < 250 && abs(low + 415) < 250) {
+              frame = (frame << 1) | 1;
+              n++;
+            } else if (abs(high - 415) < 250 && abs(low + 1250) < 250) {
+              frame = (frame << 1);
+              n++;
+            } else {
+              break;
+            }
+          }
+          if (n != 48) return;
+
+          uint32_t rid = (frame >> 24) & 0xFFFFFF;
+          uint8_t typ = (frame >> 16) & 0xFF;
+          uint8_t xb = rev8((frame >> 8) & 0xFF);
+          uint8_t yb = rev8(frame & 0xFF);
+          if (typ != 0x40 && typ != 0xC0) return;
+
+          // 2) Anlernmodus: ID uebernehmen, sobald zwei Frames hintereinander gleich sind
+          if (id(learn_mode)) {
+            if (id(learn_cand) == rid) {
+              id(learn_cnt)++;
+            } else {
+              id(learn_cand) = rid;
+              id(learn_cnt) = 1;
+            }
+            if (id(learn_cnt) >= 2) {
+              id(remote_id) = rid;
+              id(learn_mode) = false;
+              char buf[8];
+              snprintf(buf, sizeof(buf), "%06X", (unsigned int) rid);
+              id(remote_id_text).publish_state(std::string(buf));
+              id(learn_status).publish_state("gelernt: " + std::string(buf));
+              ESP_LOGW("learn", "Fernbedienungs-ID gelernt: %06X (Typ %02X, X=%u, Y=%u)",
+                       (unsigned int) rid, (unsigned int) typ, (unsigned int) xb, (unsigned int) yb);
+            }
+            return;
+          }
+
+          // 3) Normalbetrieb: fremde Fernbedienungen ignorieren
+          if (rid != (id(remote_id) & 0xFFFFFF)) return;
+
+          // AUS-Befehl (Sonderfall: X=0, Y=1)
+          if (typ == 0x40 && xb == 0 && yb == 1) {
+            if (id(terrassen_licht).state) {
+              id(terrassen_licht).publish_state(false);
+              ESP_LOGD("rf", "Licht AUS erkannt (Fernbedienung)");
+            }
+            return;
+          }
+
+          // AN / Heller / Dunkler: Stufe aus X = 3 + 7*f, Y = X + 1 (AN) bzw. X + 2 (Dimmen)
+          int xi = xb;
+          bool ok = (xi >= 3) && ((xi - 3) % 7 == 0)
+                    && (yb == (uint8_t) (xb + (typ == 0xC0 ? 2 : 1)));
+          if (!ok) {
+            ESP_LOGW("rf", "Frame mit bekannter ID, aber unbekanntem Format: Typ %02X, X=%u, Y=%u",
+                     (unsigned int) typ, (unsigned int) xb, (unsigned int) yb);
+            return;
+          }
+          int f = (xi - 3) / 7;
+
+          if (!id(terrassen_licht).state) id(terrassen_licht).publish_state(true);
+          float cur = id(terrasse_helligkeit).state;
+          if (std::isnan(cur) || (int) cur != f) {
+            id(terrasse_helligkeit).publish_state(f);
+            ESP_LOGD("rf", "Licht AN / Helligkeit von Fernbedienung erkannt (Stufe: %d)", f);
+          }
+
+# ---------------------------------------------------------------------------
+# Skripte
+# ---------------------------------------------------------------------------
+script:
+  # Sendet 7 Frames: Kennung (aus 'remote_id') + 24 Bit Nutzdaten ('payload')
+  - id: send_frame
+    mode: queued
+    parameters:
+      payload: int
+    then:
+      - remote_transmitter.transmit_raw:
+          code: !lambda |-
+            uint64_t frame = ((uint64_t) (id(remote_id) & 0xFFFFFF) << 24)
+                           | ((uint64_t) payload & 0xFFFFFF);
+            std::vector<int32_t> c;
+            for (int r = 0; r < 7; r++) {
+              c.push_back(410);  c.push_back(-12900);
+              for (int i = 47; i >= 0; i--) {
+                if ((frame >> i) & 1) { c.push_back(1250); c.push_back(-415); }
+                else                  { c.push_back(415);  c.push_back(-1250); }
+              }
+              c.push_back(815);  c.push_back(-2500);
+            }
+            return c;
+
+  # AN (typ 64) oder Dimmen (typ 192) mit Stufe f (0..36)
+  - id: send_level
+    mode: queued
+    parameters:
+      f: int
+      typ: int          # 192 = Dimmen (0xC0), 64 = AN (0x40)
+    then:
+      - script.execute:
+          id: send_frame
+          payload: !lambda |-
+            auto rev8 = [](uint8_t v) {
+              uint8_t r = 0;
+              for (int i = 0; i < 8; i++) r = (r << 1) | ((v >> i) & 1);
+              return r;
+            };
+            int lvl = std::max(0, std::min(36, f));
+            uint8_t xv = (3 + 7 * lvl) & 0xFF;
+            uint8_t yv = (xv + (typ == 0xC0 ? 2 : 1)) & 0xFF;
+            return (int) (((uint32_t) typ << 16) | ((uint32_t) rev8(xv) << 8) | rev8(yv));
+
+  # AUS: fester Code (Typ 0x40, X=0, Y=1)
+  - id: send_off
+    then:
+      - script.execute:
+          id: send_frame
+          payload: !lambda 'return 0x400080;'
+
+  # Anlernmodus fuer 30 Sekunden
+  - id: learn_start
+    mode: restart
+    then:
+      - lambda: |-
+          id(learn_mode) = true;
+          id(learn_cand) = 0;
+          id(learn_cnt) = 0;
+          id(learn_status).publish_state("Warte auf Taste der Fernbedienung (30 s)");
+          ESP_LOGW("learn", "Anlernmodus aktiv - jetzt eine Taste der Fernbedienung druecken");
+      - delay: 30s
+      - lambda: |-
+          if (id(learn_mode)) {
+            id(learn_mode) = false;
+            id(learn_status).publish_state("Zeitueberschreitung - nichts empfangen");
+            ESP_LOGW("learn", "Anlernmodus beendet: kein gueltiges Signal empfangen");
+          }
+
+# ---------------------------------------------------------------------------
+# Entitaeten
+# ---------------------------------------------------------------------------
+switch:
+  - platform: template
+    name: "Terrassenbeleuchtung"
+    id: terrassen_licht
+    icon: "mdi:ceiling-light"
+    optimistic: true
+    restore_mode: DISABLED
+    turn_on_action:
+      - script.execute:
+          id: send_level
+          f: !lambda |-
+            float s = id(terrasse_helligkeit).state;
+            return std::isnan(s) ? 20 : (int) s;
+          typ: 64
+    turn_off_action:
+      - script.execute: send_off
+
+number:
+  - platform: template
+    name: "Terrasse Helligkeitsstufe"
+    id: terrasse_helligkeit
+    min_value: 0
+    max_value: 36
+    step: 1
+    optimistic: true
+    initial_value: 20
+    restore_value: true
+    set_action:
+      - if:
+          condition:
+            lambda: 'return id(terrassen_licht).state;'
+          then:
+            - script.execute:
+                id: send_level
+                f: !lambda "return (int) x;"
+                typ: 192
+
+button:
+  - platform: template
+    name: "Fernbedienung anlernen"
+    icon: "mdi:remote"
+    entity_category: config
+    on_press:
+      - script.execute: learn_start
+
+text_sensor:
+  - platform: template
+    name: "Fernbedienungs-ID"
+    id: remote_id_text
+    icon: "mdi:identifier"
+    entity_category: diagnostic
+  - platform: template
+    name: "Anlern-Status"
+    id: learn_status
+    icon: "mdi:school"
+    entity_category: diagnostic
