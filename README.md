@@ -1,4 +1,4 @@
-# Control a patio roof lighting with ESPHome (ESP32 + CC1101)
+# Hamulight-L2446-remote-control-in-ESPHome (ESP32 + CC1101)
 
 This project lets you control a wireless patio roof lighting that originally only works with its own 433 MHz remote control. Using **ESPHome** and **Home Assistant**, you get on/off and brightness control. An ESP32 with a CC1101 radio module imitates the remote's signal and also listens, so Home Assistant follows along when someone uses the original remote.
 
@@ -9,6 +9,8 @@ This project lets you control a wireless patio roof lighting that originally onl
 > In particular, the brightness calculation was worked out from one remote only. The learning mode (see [Learn the remote](#learn-the-remote-synchronize)) has **not been tested with a second, different remote**.
 >
 > Use at your own risk. This project is not affiliated with the manufacturer; all names and trademarks belong to their respective owners.
+>
+> This Code was developed with AI.
 
 ## Features
 
